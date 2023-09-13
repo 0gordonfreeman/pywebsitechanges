@@ -1,6 +1,10 @@
+import time
+import shutil
+from win10toast import ToastNotifier
 import sys
 import os
 import smtplib
+import json
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -15,55 +19,35 @@ import cv2
 import numpy as np
 from loguru import logger
 
-# use hosts file to remove ads for more reproducible websites
-hostsfile = "http://sbc.io/hosts/alternates/fakenews-gambling-porn-social/hosts"
 
 indexjs = r"""
 const fs = require('fs');
 
 const puppeteer = require('puppeteer');
 
-hosts = {};
-//now we read the host file
-var hostFile = fs.readFileSync('hosts', 'utf8').split('\n');
-var hosts = {};
-for (var i = 0; i < hostFile.length; i++) {
-    if (hostFile[i].charAt(0) == "#") {
-        continue
-    }
-    var frags = hostFile[i].split(' ');
-    if (frags.length > 1 && frags[0] === '0.0.0.0') {
-        hosts[frags[1].trim()] = true;
-    }
-}
+//get Cookies
+var cookieFile = fs.readFileSync('cookie.json', 'utf8');
+let cookieFileJson = JSON.parse(cookieFile);
 
 (async () => {
 
-    const browser = await puppeteer.launch({ headless: true });
+    const browser = await puppeteer.launch({ headless: 'new' });
     const page = await browser.newPage();
     await page.setRequestInterception(true)
 
     page.on('request', request => {
-
-        var domain = null;
-        var frags = request.url().split('/');
-        if (frags.length > 2) {
-            domain = frags[2];
-        }
-
-        // just abort if found
-        if (hosts[domain] === true) {
-            request.abort();
-        } else {
-            request.continue();
-        }
+        request.continue();
     });
     // Adjustments particular to this page to ensure we hit desktop breakpoint.
     page.setViewport({ width: 1000, height: 1000, deviceScaleFactor: 1 });
+    page.setCookie({
+        'name': cookieFileJson.name,
+        'value': cookieFileJson.value,
+        'domain': cookieFileJson.domain
+      });
 
-    await page.goto(process.argv[2], { waitUntil: 'networkidle2' });
-    await page.waitFor(5000);
-
+    const response = await page.goto(process.argv[2], { waitUntil: 'networkidle2' });
+    await new Promise(r => setTimeout(r,500))
     if (process.argv[4] == 'full') {
         await page.screenshot({
             path: process.argv[3],
@@ -118,7 +102,7 @@ for (var i = 0; i < hostFile.length; i++) {
 })();
 """
 
-
+@logger.catch
 def compare_images(img1, img2):
     before = cv2.imread(img1)
     after = cv2.imread(img2)
@@ -175,26 +159,24 @@ def compare_images(img1, img2):
     return score
 
 
-def send_email(smtpemail, smtppass, to, subject, body, imgname):
-    img_data = open(imgname, "rb").read()
-    msg = MIMEMultipart()
-    msg["Subject"] = subject
-    msg["From"] = smtpemail
-    msg["To"] = to
+def win10Notify(similarity):
+    notify = ToastNotifier()
+    notify.show_toast(
+        "Requests",
+        "Änderungen: " + str(similarity),
+        duration = 10,
+        icon_path = None,
+        threaded = True,
+    )
 
-    text = MIMEText(body)
-    msg.attach(text)
-    image = MIMEImage(img_data, name=os.path.basename(imgname))
-    msg.attach(image)
-
-    s = smtplib.SMTP("smtp.gmail.com", "587")
-    s.ehlo()
-    s.starttls()
-    s.ehlo()
-    s.login(smtpemail, smtppass)
-    s.sendmail(msg["From"], msg["To"], msg.as_string())
-    s.quit()
-
+#Liefert die Filesize für das übergebene File in KB
+def getFileSize(filename):
+  with open(filename, "rb") as f:
+    f.seek(0, os.SEEK_END)        
+    filesize = f.tell()
+    ##convert to kb
+    filesize/= 1024.0    
+  return filesize
 
 @click.command()
 @click.option("--folder", default=".", help="directory to store data")
@@ -204,37 +186,43 @@ def send_email(smtpemail, smtppass, to, subject, body, imgname):
 @click.option("--smtpemail", default="", help="SMTP email address")
 @click.option("--smtppass", default="", help="SMTP email password")
 @click.option("--threshold", default=1.0, help="threshold for sending email")
-def run(folder, url, css, to, smtpemail, smtppass, threshold):
-    logger.debug("changing dir to {}", folder)
+@click.option("--sessionid", default="", help="Sessionid")
+@logger.catch
+def run(folder, url, css, to, smtpemail, smtppass, threshold,sessionid):
     os.chdir(folder)
     with open("index.js", "w") as f:
         f.write(indexjs)
     if not os.path.exists(os.path.join("node_modules", "puppeteer")):
         logger.debug("installing puppeteer in {}", os.path.abspath("."))
         os.system("npm i puppeteer")
-    if not os.path.exists(os.path.join("hosts")):
-        logger.debug("downloading hosts file {}", hostsfile)
-        urllib.request.urlretrieve(hostsfile, "hosts")
-    node_cmd = "node index.js " + url + " new.png '" + css + "'"
-    logger.debug(node_cmd)
+    with open('cookie.json', 'w') as file:
+        cookie = {
+			   "name": "PSESSIONID", 
+			   "value": sessionid,
+				"domain": "www.campusonline.at"
+        }
+        json.dump(cookie, file)				
+    node_cmd = "node index.js \"" + url + "\" new.png " + css 
+    #logger.info(node_cmd)
+    timestr = time.strftime("%Y%m%d-%H%M%S")
     os.system(node_cmd)
     if os.path.exists("last.png"):
-        logger.debug("comparing images")
+        #logger.debug("comparing images")
         similarity = compare_images("last.png", "new.png")
-        logger.debug("similarity: {}", similarity)
-        if similarity < threshold and smtpemail != "" and smtppass != "" and to != "":
-            logger.debug("similarity < 0.99, sending email")
-            logger.debug(os.path.join(os.path.abspath("."), "after.jpg"))
-            send_email(
-                smtpemail,
-                smtppass,
-                to,
-                "web change " + datetime.now().strftime("%m/%d/%Y %H:%M:%S"),
-                url,
-                os.path.join(os.path.abspath("."), "after.jpg"),
-            )
-        os.remove("last.png")
-    logger.debug("saving new image")
+        logger.info("similarity: {}", similarity)
+		
+        if similarity < threshold:
+          #filesize des neuen Screenshots ermitteln
+          filesize = getFileSize("new.png")
+          if filesize > 99:
+            logger.info("similarity < threshold (" + str(threshold) + ") ,  notify")
+            win10Notify(similarity)
+          else:
+            logger.info("Sessionid ausgelaufen")  
+            win10Notify("Sessionid ausgelaufen")
+            
+          shutil.copy("after.jpg","archive/changes_"+timestr+".jpg")  
+        os.remove("last.png")   
     os.rename("new.png", "last.png")
 
 
